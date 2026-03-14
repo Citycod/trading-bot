@@ -85,13 +85,10 @@ class PatternDetector:
     def detect_all(self, df: pd.DataFrame) -> Tuple[List[PatternResult], List[float]]:
         """
         Run all pattern detectors on the DataFrame.
-
-        Args:
-            df: OHLCV DataFrame with at least 20 rows.
-
-        Returns:
-            Tuple of (list_of_pattern_results, support_resistance_levels).
         """
+        # Ensure no duplicate columns
+        df = df.loc[:, ~df.columns.duplicated()]
+
         patterns: List[PatternResult] = []
 
         if df is None or len(df) < 5:
@@ -951,14 +948,14 @@ class PatternDetector:
         swing_highs = self._find_swing_highs(df)
         swing_lows = self._find_swing_lows(df)
 
-        if not swing_highs or not swing_lows:
+        if len(swing_highs) == 0 or len(swing_lows) == 0:
             return results
 
-        current_close = df["close"].iloc[-1]
+        current_close = float(df["close"].iloc[-1])
 
         # 1. Bearish BOS: Close below recent swing low
         last_low_idx = swing_lows[-1]
-        last_low_price = df["close"].iloc[last_low_idx]
+        last_low_price = float(df["close"].iloc[last_low_idx])
 
         if current_close < last_low_price:
             log.info(
@@ -970,13 +967,13 @@ class PatternDetector:
                     direction="bearish",
                     confidence=80.0,
                     candle_range=[int(last_low_idx), len(df) - 1],
-                    metadata={"level": float(last_low_price)},
+                    metadata={"level": last_low_price},
                 )
             )
 
         # 2. Bullish BOS: Close above recent swing high
         last_high_idx = swing_highs[-1]
-        last_high_price = df["close"].iloc[last_high_idx]
+        last_high_price = float(df["close"].iloc[last_high_idx])
 
         if current_close > last_high_price:
             log.info(
@@ -988,7 +985,7 @@ class PatternDetector:
                     direction="bullish",
                     confidence=80.0,
                     candle_range=[int(last_high_idx), len(df) - 1],
-                    metadata={"level": float(last_high_price)},
+                    metadata={"level": last_high_price},
                 )
             )
 

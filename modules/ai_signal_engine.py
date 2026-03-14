@@ -55,8 +55,15 @@ The JSON must exactly follow this schema:
   "take_profit_2": float,
   "reasoning": "concise explanation under 200 words",
   "key_patterns": ["list", "of", "key", "pattern"],
-  "risk_reward_ratio": float
+  "risk_reward_ratio": float,
+  "hold_duration": "SCALP" or "INTRADAY" or "SWING",
+  "hold_reasoning": "brief explanation of expected hold time, e.g. '15-30 min scalp on momentum' or '2-3 day swing on strong trend'"
 }
+
+Hold Duration Guidelines:
+- SCALP: Hold for minutes to ~1 hour. Use for quick momentum plays, news spikes, or range-bound scalps.
+- INTRADAY: Hold for hours within the same trading day. Use when trend is clear but not strong enough for multi-day.
+- SWING: Hold for 1-5+ days. Use when there is a strong trend (high ADX), clear breakout, or strong support/resistance setup.
 """
 
 
@@ -73,6 +80,8 @@ class TradeSignal:
     reasoning: str = ""
     key_patterns: List[str] = field(default_factory=list)
     risk_reward_ratio: float = 0.0
+    hold_duration: str = ""        # "SCALP" | "INTRADAY" | "SWING"
+    hold_reasoning: str = ""       # Why this hold duration
     symbol: str = ""
     timeframe: str = ""
     provider: str = ""
@@ -337,6 +346,8 @@ class AISignalEngine:
                 reasoning=data.get("reasoning", ""),
                 key_patterns=data.get("key_patterns", []),
                 risk_reward_ratio=float(data.get("risk_reward_ratio", 0)),
+                hold_duration=data.get("hold_duration", "INTRADAY").upper(),
+                hold_reasoning=data.get("hold_reasoning", ""),
                 symbol=symbol,
                 timeframe=timeframe,
                 raw_response=data,

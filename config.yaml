@@ -8,6 +8,8 @@ trading:
   mode: "paper"
   exchange: "mt5"
   scan_interval: 60
+  session_filter: true    # NEW: only trade during London/NY volatility
+  wait_for_bar_close: true # Prevent scalping by waiting for candle to finish
 
 # ─── MetaTrader 5 Settings ─────────────────────────────────────────────────
 mt5:
@@ -31,6 +33,12 @@ signals:
   min_confidence: 75           # minimum AI confidence score to act
   require_confluence: true
   min_confluence_count: 3      # patterns + indicator signals needed
+  signal_cooldown_minutes: 15  # min wait between signals per symbol
+
+# ─── Market Hours ──────────────────────────────────────────────────────────
+market_hours:
+  enforce_forex_close: true          # pause bot during weekend closure
+  timezone: "America/New_York"       # Friday 5 PM → Sunday 5 PM in this TZ
 
 # ─── AI Provider Configuration ─────────────────────────────────────────────
 ai:
@@ -77,6 +85,7 @@ backtesting:
   initial_capital: 10000
   commission: 0.001            # 0.1% per trade (Binance maker/taker)
   report_dir: "backtest_reports"
+  test_timeframes: ["5m", "15m", "30m", "1h"]
 
 paper_trading:
   initial_balance: 10000       # virtual USDT balance

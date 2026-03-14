@@ -98,6 +98,13 @@ class AlertingEngine:
     def notify_signal(self, signal: Any) -> None:
         """Alert on new signal generation."""
         icon = "🚀" if signal.signal == "BUY" else "🔻"
+
+        # Hold duration display
+        hold_icons = {"SCALP": "⚡", "INTRADAY": "☀️", "SWING": "🌊"}
+        hold_icon = hold_icons.get(getattr(signal, "hold_duration", ""), "⏱")
+        hold_duration = getattr(signal, "hold_duration", "N/A") or "N/A"
+        hold_reasoning = getattr(signal, "hold_reasoning", "") or ""
+
         msg = (
             f"{icon} *NEW SIGNAL: {signal.symbol}* {icon}\n"
             f"Direction: `{signal.signal}`\n"
@@ -107,8 +114,12 @@ class AlertingEngine:
             f"TP1: `{signal.take_profit_1:.4f}`\n"
             f"TP2: `{signal.take_profit_2:.4f}`\n"
             f"R/R: `{signal.risk_reward_ratio:.2f}`\n\n"
-            f"*Reasoning:* {signal.reasoning}"
+            f"{hold_icon} *Hold:* `{hold_duration}`\n"
         )
+        if hold_reasoning:
+            msg += f"_{hold_reasoning}_\n\n"
+        msg += f"*Reasoning:* {signal.reasoning}"
+
         self.send_message(msg)
 
     def notify_order_filled(self, order: Any) -> None:

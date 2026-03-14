@@ -21,7 +21,7 @@ import argparse
 import asyncio
 import signal
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -37,6 +37,7 @@ from modules.pattern_detector import PatternDetector
 from modules.risk_manager import RiskManager
 from utils.helpers import load_config
 from utils.logger import get_logger, configure_from_config
+from utils.market_hours import is_market_closed
 
 # Load environment variables from .env
 load_dotenv()
@@ -79,6 +80,9 @@ class TradingBot:
 
         # Historical tracking for dashboard
         self.signal_history: List[Dict[str, Any]] = []
+        self.last_bar_time: Dict[str, datetime] = {}
+        self.last_signal_time: Dict[str, datetime] = {}  # Per-symbol cooldown
+        self._market_closed_notified = False  # Avoid spamming "market closed"
         self.running = False
 
     async def start(self) -> None:
@@ -97,6 +101,30 @@ class TradingBot:
 
         try:
             while self.running:
+                # ── Market Hours Guard ─────────────────────────────
+                mh_cfg = self.config.get("market_hours", {})
+                if mh_cfg.get("enforce_forex_close", True):
+                    tz_str = mh_cfg.get("timezone", "America/New_York")
+                    closed, msg = is_market_closed(tz_str)
+                    if closed:
+                        if not self._market_closed_notified:
+                            log.info(msg)
+                            self.alerting_engine.send_message(
+                                f"🌙 *Market Closed*\n{msg}\n\nBot is paused until market reopens.",
+                                silent=True,
+                            )
+                            self._market_closed_notified = True
+                        await asyncio.sleep(300)  # Check again in 5 minutes
+                        continue
+                    else:
+                        if self._market_closed_notified:
+                            log.info("Forex market is now OPEN. Resuming scanning.")
+                            self.alerting_engine.send_message(
+                                "☀️ *Market Open*\nForex market has reopened. Bot is resuming.",
+                                silent=True,
+                            )
+                            self._market_closed_notified = False
+
                 for symbol in self.config["trading"]["symbols"]:
                     try:
                         await self.process_symbol(symbol)
@@ -153,6 +181,22 @@ class TradingBot:
             await self.manage_open_position(symbol, df)
             return
 
+        # 5.5 Bar Close Logic (Prevents Scalping)
+        last_ts = df.index[-1]
+        if self.config["trading"].get("wait_for_bar_close", True):
+            if symbol in self.last_bar_time and last_ts <= self.last_bar_time[symbol]:
+                # Still in the same candle, skip analysis effectively throttling the bot
+                return
+            self.last_bar_time[symbol] = last_ts
+
+        # 5.6 Signal Cooldown (Prevents excessive signals)
+        cooldown_min = self.config.get("signals", {}).get("signal_cooldown_minutes", 15)
+        if symbol in self.last_signal_time:
+            elapsed = (datetime.now(timezone.utc) - self.last_signal_time[symbol]).total_seconds() / 60
+            if elapsed < cooldown_min:
+                log.debug(f"Signal cooldown active for {symbol}: {cooldown_min - elapsed:.1f} min remaining")
+                return
+
         # 6. Generate AI Signal (with MTA Context)
         signal = self.ai_signal_engine.analyze(
             df, patterns, sr_levels, symbol, timeframe, htf_context=htf_context
@@ -171,6 +215,9 @@ class TradingBot:
 
         if signal.signal == "HOLD":
             return
+
+        # Record signal time for cooldown
+        self.last_signal_time[symbol] = datetime.now(timezone.utc)
 
         # Notify on potentially actionable signal (high confidence)
         if signal.confidence >= 50:
@@ -227,12 +274,18 @@ class TradingBot:
                 )
 
     async def run_backtest(self) -> None:
-        """Run backtesting mode and exit."""
+        """Run backtesting mode for multiple timeframes and exit."""
         bt = Backtester(self.config, self.data_engine)
+        
+        # Use config timeframes if none provided in args
+        timeframes = [self.args.timeframe] if self.args.timeframe else self.config.get("backtesting", {}).get("test_timeframes", ["1h"])
+        
         for symbol in self.config["trading"]["symbols"]:
-            result = bt.run(symbol)
-            report_path = bt.generate_html_report(result)
-            print(f"Backtest Report for {symbol}: {report_path}")
+            for tf in timeframes:
+                log.info(f"Starting backtest for {symbol} on {tf}...")
+                result = bt.run(symbol, tf)
+                report_path = bt.generate_html_report(result)
+                print(f"[{tf}] Backtest Report for {symbol}: {report_path}")
 
 
 def main():

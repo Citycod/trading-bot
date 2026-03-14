@@ -88,7 +88,8 @@ class IndicatorEngine:
             )
             return df
 
-        df = df.copy()
+        # Ensure no duplicate columns before computing indicators
+        df = df.loc[:, ~df.columns.duplicated()].copy()
 
         try:
             df = self._compute_trend(df)
@@ -320,42 +321,53 @@ class IndicatorEngine:
 
     def _compute_divergence(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Detect simple bullish/bearish divergences between price and RSI.
-        Lookback of 20 candles for local peaks/troughs comparison.
+        Detect robust bullish/bearish divergences between price and RSI.
+        Uses local extrema (peaks/troughs) to find non-alignments.
         """
-        if "RSI_14" not in df.columns or len(df) < 30:
+        if "RSI_14" not in df.columns or len(df) < 50:
             return df
 
         df["is_bullish_div"] = False
         df["is_bearish_div"] = False
 
-        # Simple 3-point check for current vs previous local extremum (simplified)
-        # For a production bot, we'd use robust peak detection.
-        # This flags a potential divergence at the current bar.
+        # Find local troughs for bullish divergence
+        # Lowest in 5-bar window
+        df["price_low_window"] = df["low"].rolling(5, center=True).min()
+        df["rsi_low_window"] = df["RSI_14"].rolling(5, center=True).min()
 
-        try:
-            # Bullish Divergence: Price Lower Low, RSI Higher Low
-            # (Comparing current bar to 10 bars ago as a proxy for 'previous trough')
-            price_prev = df["low"].shift(10)
-            rsi_prev = df["RSI_14"].shift(10)
+        # Identify local troughs where price makes LL but RSI makes HL
+        # Previous trough (shifted 5 to 20 bars)
+        df["prev_price_low"] = df["low"].shift(10).rolling(15).min()
+        df["prev_rsi_low"] = df["RSI_14"].shift(10).rolling(15).min()
 
-            df["is_bullish_div"] = (
-                (df["low"] < price_prev)
-                & (df["RSI_14"] > rsi_prev)
-                & (df["RSI_14"] < 40)
-            )
+        df["is_bullish_div"] = (
+            (df["low"] < df["prev_price_low"])
+            & (df["RSI_14"] > df["prev_rsi_low"])
+            & (df["RSI_14"] < 35)
+        )
 
-            # Bearish Divergence: Price Higher High, RSI Lower High
-            price_prev_h = df["high"].shift(10)
-            rsi_prev_h = df["RSI_14"].shift(10)
+        # Identify local peaks where price makes HH but RSI makes LH
+        df["prev_price_high"] = df["high"].shift(10).rolling(15).max()
+        df["prev_rsi_high"] = df["RSI_14"].shift(10).rolling(15).max()
 
-            df["is_bearish_div"] = (
-                (df["high"] > price_prev_h)
-                & (df["RSI_14"] < rsi_prev_h)
-                & (df["RSI_14"] > 60)
-            )
-        except Exception:
-            pass
+        df["is_bearish_div"] = (
+            (df["high"] > df["prev_price_high"])
+            & (df["RSI_14"] < df["prev_rsi_high"])
+            & (df["RSI_14"] > 65)
+        )
+
+        # Cleanup temp columns
+        df.drop(
+            columns=[
+                "price_low_window",
+                "rsi_low_window",
+                "prev_price_low",
+                "prev_rsi_low",
+                "prev_price_high",
+                "prev_rsi_high",
+            ],
+            inplace=True,
+        )
 
         return df
 
@@ -393,16 +405,26 @@ class IndicatorEngine:
         else:
             df["is_consolidating"] = False
 
-        if (
-            "is_liquidity_sweep_bearish" in df.columns
-            and df["is_liquidity_sweep_bearish"].any()
-        ):
-            log.info(f"SMC: Bearish Liquidity Sweep detected on {df.index[-1]}")
-        if (
-            "is_liquidity_sweep_bullish" in df.columns
-            and df["is_liquidity_sweep_bullish"].any()
-        ):
-            log.info(f"SMC: Bullish Liquidity Sweep detected on {df.index[-1]}")
+        last_idx = df.index[-1]
+
+        # Robust scalar check to avoid 'truth value of array is ambiguous' errors
+        def get_last_val(col_name: str) -> bool:
+            if col_name not in df.columns:
+                return False
+            col = df[col_name]
+            # If duplicated, take the first one
+            val = (
+                col.iloc[-1]
+                if not isinstance(col.iloc[-1], pd.Series)
+                else col.iloc[-1].iloc[0]
+            )
+            return bool(val)
+
+        if get_last_val("is_liquidity_sweep_bearish"):
+            log.info(f"SMC: Bearish Liquidity Sweep detected on {last_idx}")
+
+        if get_last_val("is_liquidity_sweep_bullish"):
+            log.info(f"SMC: Bullish Liquidity Sweep detected on {last_idx}")
 
         return df
 

@@ -24,8 +24,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 import requests
-
+from modules.news_filter import NewsFilter
+from modules.ml_validator import MLValidator
 from modules.ai_signal_engine import TradeSignal
 from utils.helpers import (
     calc_position_size,
@@ -70,6 +72,7 @@ class PositionSizing:
     atr: float = 0.0
     approved: bool = False
     rejection_reason: str = ""
+    ml_snapshot: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -101,6 +104,7 @@ class OpenPosition:
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     trailing_stop: Optional[float] = None
     tp1_hit: bool = False
+    ml_snapshot: Dict[str, Any] = field(default_factory=dict)
 
     def unrealised_pnl(self, current_price: float) -> float:
         """Calculate unrealised P&L in quote currency."""
@@ -135,6 +139,7 @@ class RiskManager:
 
         # Journaling setup
         self.journal_path = os.path.join("logs", "trade_journal.csv")
+        self.ml_dataset_path = os.path.join("logs", "ml_dataset.jsonl")
         self._init_journal()
 
         news_cfg = config.get("news", {})
@@ -142,6 +147,18 @@ class RiskManager:
         self.news_buffer_minutes: int = news_cfg.get("news_buffer_minutes", 30)
         self.finnhub_enabled: bool = news_cfg.get("finnhub_enabled", False)
         self.finnhub_key: str = os.getenv("FINNHUB_API_KEY", "")
+
+        self.news_filter = NewsFilter(config)
+        self.ml_validator = MLValidator()
+
+        # Session windows (UTC)
+        self.sessions = {
+            "london": {"start": 8, "end": 16},
+            "new_york": {"start": 13, "end": 21},
+        }
+        self.session_filter_enabled = config.get("trading", {}).get(
+            "session_filter", True
+        )
 
         # Correlation groups to prevent over-exposure
         self.correlation_groups = [
@@ -197,6 +214,16 @@ class RiskManager:
         sym = symbol or signal.symbol
         sizing = PositionSizing(symbol=sym)
 
+        # Pre-calculate indicator snapshot for ML training (even if rejected, we might want to know why)
+        indicators = {}
+        if df is not None and not df.empty:
+            last_row = df.iloc[-1]
+            for col in df.columns:
+                if col not in ["open", "high", "low", "close", "volume"]:
+                    val = last_row[col]
+                    indicators[col] = 0.0 if pd.isna(val) else float(val)
+        sizing.ml_snapshot = indicators
+
         # 1. Bot paused?
         self._reset_daily_pnl_if_new_day()
         if self.bot_paused:
@@ -234,13 +261,25 @@ class RiskManager:
             log.info(f"Signal rejected (correlation): {sym}")
             return False, sizing
 
+        # 4. Session Filter
+        if self.session_filter_enabled and not self._is_in_trading_session():
+            sizing.rejection_reason = "Outside of volatile trading sessions (London/NY)"
+            log.info(f"Signal rejected (session filter): {sym}")
+            return False, sizing
+
         # 5. High-impact news event check
-        if self.skip_high_impact_news and self._is_near_news_event():
+        if self.news_filter.is_trading_suspended():
             sizing.rejection_reason = "High-impact news event — trading suspended"
             log.info(f"Signal rejected (news event): {sym}")
             return False, sizing
 
-        # 5. Signal confidence
+        # 6. ML Signature Check (The Gatekeeper)
+        if not self.ml_validator.is_approved(sizing.ml_snapshot):
+            sizing.rejection_reason = (
+                "ML Rejection: Setup history shows low win probability"
+            )
+            log.info(f"Signal rejected (ML validation): {sym}")
+            return False, sizing
         if not signal.is_actionable(self.min_rr_ratio):
             sizing.rejection_reason = (
                 f"Signal not actionable: confidence={signal.confidence:.1f} "
@@ -334,6 +373,7 @@ class RiskManager:
             stop_loss=sizing.stop_loss,
             take_profit_1=sizing.take_profit_1,
             take_profit_2=sizing.take_profit_2,
+            ml_snapshot=sizing.ml_snapshot,
         )
         self.open_positions[sizing.symbol] = pos
         self.trades_today += 1
@@ -481,64 +521,20 @@ class RiskManager:
             self.daily_pnl / self.initial_balance if self.initial_balance > 0 else 0.0
         )
 
-    # ─── News Event Filter ────────────────────────────────────────────────────
-
-    def _is_near_news_event(self) -> bool:
+    def _is_in_trading_session(self) -> bool:
         """
-        Check if we are within `news_buffer_minutes` of a high-impact event.
-
-        Uses Finnhub economic calendar if API key is provided.
-        Returns False if Finnhub is disabled or API call fails.
-
-        Returns:
-            True if a high-impact news event is imminent.
+        Check if current UTC time falls within London or New York sessions.
         """
-        if not self.finnhub_enabled or not self.finnhub_key:
-            return False
+        now_utc = datetime.now(timezone.utc).hour
 
-        try:
-            now = datetime.now(timezone.utc)
-            from_ts = int(
-                (now - timedelta(minutes=self.news_buffer_minutes)).timestamp()
-            )
-            to_ts = int((now + timedelta(minutes=self.news_buffer_minutes)).timestamp())
-
-            url = "https://finnhub.io/api/v1/calendar/economic"
-            params = {
-                "token": self.finnhub_key,
-                "from": now.strftime("%Y-%m-%d"),
-                "to": now.strftime("%Y-%m-%d"),
-            }
-            resp = requests.get(url, params=params, timeout=5)
-            if resp.status_code != 200:
-                return False
-
-            events = resp.json().get("economicCalendar", [])
-            for event in events:
-                impact = event.get("impact", "").lower()
-                if impact != "high":
-                    continue
-                event_time_str = event.get("time", "")
-                if not event_time_str:
-                    continue
-                try:
-                    event_time = datetime.fromisoformat(event_time_str)
-                    if event_time.tzinfo is None:
-                        event_time = event_time.replace(tzinfo=timezone.utc)
-                    delta = abs((event_time - now).total_seconds()) / 60
-                    if delta <= self.news_buffer_minutes:
-                        log.info(
-                            f"High-impact news event within {self.news_buffer_minutes}m: "
-                            f"{event.get('event', 'unknown')}"
-                        )
-                        return True
-                except ValueError:
-                    continue
-
-        except Exception as exc:
-            log.debug(f"News event check failed: {exc}")
-
+        for session, window in self.sessions.items():
+            if window["start"] <= now_utc < window["end"]:
+                return True
         return False
+
+    # ─── News Event Filter ────────────────────────────────────────────────────
+    # High-impact news filtering is now handled by modules/news_filter.py
+    # integrated via the evaluate_signal method.
 
     def _is_highly_correlated_open(self, symbol: str) -> bool:
         """Check if any currently open position is in a symbol highly correlated with `symbol`."""
@@ -603,7 +599,21 @@ class RiskManager:
                         f"{duration:.1f}",
                     ]
                 )
-            log.debug(f"Trade logged to journal: {pos.symbol}")
+
+            # Persist ML snapshot for training
+            if pos.ml_snapshot:
+                ml_entry = {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol": pos.symbol,
+                    "direction": pos.direction,
+                    "pnl_pct": pnl_pct,
+                    "win": 1 if pnl > 0 else 0,
+                    "features": pos.ml_snapshot,
+                }
+                with open(self.ml_dataset_path, mode="a") as f:
+                    f.write(json.dumps(ml_entry) + "\n")
+
+            log.debug(f"Trade logged to journal and ML dataset: {pos.symbol}")
         except Exception as e:
             log.error(f"Failed to log trade to journal: {e}")
 
