@@ -20,7 +20,9 @@ Usage:
 import argparse
 import asyncio
 import signal
+import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -131,6 +133,12 @@ class TradingBot:
                     except Exception as exc:
                         log.error(f"Error processing {symbol}: {exc}", exc_info=True)
 
+                # Send heartbeat to execution server after each scan cycle
+                try:
+                    self._send_heartbeat()
+                except Exception as e:
+                    log.debug(f"Heartbeat send failed (server may not be running): {e}")
+
                 # Wait for next scan interval
                 interval = self.config["trading"].get("scan_interval", 60)
                 await asyncio.sleep(interval)
@@ -213,6 +221,12 @@ class TradingBot:
             }
         )
 
+        # Sync all signals to Execution Server for MT5 Dashboard
+        try:
+            self._sync_signal_to_server(signal)
+        except Exception as e:
+            log.warning(f"Failed to sync signal to server: {e}")
+
         if signal.signal == "HOLD":
             return
 
@@ -272,6 +286,56 @@ class TradingBot:
                 self.alerting_engine.notify_position_closed(
                     symbol, pnl, reason, order.price
                 )
+
+    def _sync_signal_to_server(self, signal: Any) -> None:
+        """Helper to push the latest AI analysis to the execution server."""
+        import requests
+        
+        url = "http://localhost:8000/signals"
+        api_key = os.getenv("EXECUTION_BRIDGE_KEY", "default_secret_key")
+        
+        payload = {
+            "symbol": signal.symbol,
+            "direction": signal.signal,
+            "entry_price": float(signal.entry_price),
+            "stop_loss": float(signal.stop_loss),
+            "take_profit": float(signal.take_profit_1),
+            "confidence": float(signal.confidence),
+            "reasoning": signal.reasoning,
+            "timestamp": time.time()
+        }
+        
+        headers = {"X-API-KEY": api_key}
+        requests.post(url, json=payload, headers=headers, timeout=5)
+
+    def _send_heartbeat(self) -> None:
+        """Send a status heartbeat to the execution server after each scan cycle."""
+        import requests
+
+        url = "http://localhost:8000/bot/heartbeat"
+        api_key = os.getenv("EXECUTION_BRIDGE_KEY", "default_secret_key")
+
+        timeframes = [
+            self.config["trading"].get("timeframe", "1h"),
+            self.config["trading"].get("higher_timeframe", "4h"),
+        ]
+        # Include backtesting timeframes if configured (shows all analyzed TFs)
+        bt_tfs = self.config.get("backtesting", {}).get("test_timeframes", [])
+        for tf in bt_tfs:
+            if tf not in timeframes:
+                timeframes.append(tf)
+
+        payload = {
+            "last_scan_time": datetime.now(timezone.utc).isoformat(),
+            "symbols_scanned": self.config["trading"]["symbols"],
+            "scan_interval": self.config["trading"].get("scan_interval", 60),
+            "timeframes_analyzed": timeframes,
+            "mode": self.config["trading"].get("mode", "paper"),
+            "total_signals_generated": len(self.signal_history),
+        }
+
+        headers = {"X-API-KEY": api_key}
+        requests.post(url, json=payload, headers=headers, timeout=5)
 
     async def run_backtest(self) -> None:
         """Run backtesting mode for multiple timeframes and exit."""
